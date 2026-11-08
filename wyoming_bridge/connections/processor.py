@@ -30,7 +30,7 @@ class ProcessorConnection:
 
             # Start background task to listen for responses
             self._listen_task = asyncio.create_task(
-                self._listen_to_events(),
+                self._listen_to_events(self._client),
                 name=f"processor_listener_{self._processor_id}"
             )
 
@@ -44,8 +44,14 @@ class ProcessorConnection:
     async def _disconnect(self) -> None:
         self._is_connected = False
 
-        # Cancel listener task
-        if self._listen_task and not self._listen_task.done():
+        # Cancel listener task. _listen_to_events() itself calls _disconnect()
+        # when its connection ends; guard against a task cancelling and then
+        # awaiting itself, which would raise and skip the cleanup below.
+        if (
+            self._listen_task
+            and not self._listen_task.done()
+            and self._listen_task is not asyncio.current_task()
+        ):
             self._listen_task.cancel()
             try:
                 await self._listen_task
@@ -68,18 +74,25 @@ class ProcessorConnection:
             finally:
                 self._client = None
     
-    async def _listen_to_events(self):
-        """Background task to read events from the processor and resolve pending futures."""
-        if not self._client:
+    async def _listen_to_events(self, client: Optional[AsyncClient] = None):
+        """Background task to read events from the processor and resolve pending futures.
+
+        Bound to the client it was started for; see WyomingTargetConnection.
+        When the connection ends (clean EOF or error) it disconnects, which
+        cancels pending response futures so blocking callers return right
+        away instead of waiting out their full timeout.
+        """
+        client = client or self._client
+        if not client:
             return
-            
+
         try:
-            while self._is_connected and self._client:
-                event = await self._client.read_event()
+            while self._is_connected and self._client is client:
+                event = await client.read_event()
                 if event is None:
                     _LOGGER.debug("Processor connection closed for '%s'", self._processor_id)
                     break
-                    
+
                 # Check for request_id in event.data
                 request_id = event.data.get("request_id") if event.data else None
                 if request_id and request_id in self._pending_responses:
@@ -89,11 +102,15 @@ class ProcessorConnection:
                         _LOGGER.debug("Resolved response future for processor '%s' (request_id: %s)", self._processor_id, request_id)
                 else:
                     _LOGGER.debug("Received event from processor '%s' without matching request_id: %s", self._processor_id, event.type)
-                    
+
+        except asyncio.CancelledError:
+            raise
         except Exception:
             _LOGGER.exception("Error reading from processor '%s'", self._processor_id)
+
+        if self._client is client:
             await self._disconnect()
-    
+
     async def write_event(self, event: Event, wait_for_response: bool = False, timeout: float = 30.0) -> Optional[Event]:
         if not self._is_connected or not self._client:
             _LOGGER.debug("Processor not connected")

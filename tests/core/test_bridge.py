@@ -253,10 +253,39 @@ class TestLifecycle:
     async def test_start_success(self, bridge):
         """Test successful start."""
         assert not bridge._running
-        
+        bridge._ensure_target = AsyncMock(return_value=True)
+
         await bridge.start()
-        
+        await asyncio.sleep(0)  # let the init task run
+
         assert bridge._running
+        bridge._ensure_target.assert_awaited_once()
+        await bridge.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_retries_until_target_ready(self, bridge):
+        """Startup handshake retries while the target is unreachable."""
+        bridge._ensure_target = AsyncMock(side_effect=[False, False, True])
+
+        with patch('wyoming_bridge.core.bridge.INIT_RETRY_MIN', 0.001):
+            await bridge.start()
+            await asyncio.wait_for(bridge._init_task, timeout=1)
+
+        assert bridge._ensure_target.await_count == 3
+        await bridge.stop()
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_pending_init(self, bridge):
+        """stop() cancels a still-retrying startup handshake."""
+        bridge._ensure_target = AsyncMock(return_value=False)
+
+        await bridge.start()
+        await asyncio.sleep(0)
+        init_task = bridge._init_task
+        await bridge.stop()
+
+        assert init_task.done()
+        assert bridge._init_task is None
 
     @pytest.mark.asyncio
     async def test_start_already_running(self, bridge):
@@ -351,14 +380,18 @@ class TestEventHandling:
 
     @pytest.mark.asyncio
     async def test_on_server_event_describe(self, bridge):
-        """Test handling Describe events from server."""
+        """Describe via on_server_event answers on the bound server writer."""
         describe_event = make_event("describe")
-        bridge._handle_describe_flow = AsyncMock()
-        
+        info_event = make_event("info")
+        bridge._get_info_event = AsyncMock(return_value=info_event)
+        bridge._server.write_event = AsyncMock()
+        bridge._downstream = AsyncMock()
+
         with patch.object(Describe, 'is_type', return_value=True):
             await bridge.on_server_event(describe_event)
-        
-        bridge._handle_describe_flow.assert_called_once_with(describe_event)
+
+        bridge._server.write_event.assert_awaited_once_with(info_event)
+        bridge._downstream.process_event.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_on_server_event_audio_chunk(self, bridge):
@@ -391,11 +424,30 @@ class TestEventHandling:
         """Test handling events with no downstream flow."""
         regular_event = make_event("transcript")
         bridge._downstream = None
-        
+        bridge._ensure_target = AsyncMock(return_value=False)
+
         with patch.object(Describe, 'is_type', return_value=False):
             await bridge.on_server_event(regular_event)
-        
+
+        bridge._ensure_target.assert_awaited_once()
         assert "No downstream flow found" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_on_server_event_lazily_initializes_target(self, bridge):
+        """If startup init hasn't succeeded yet, the first event sets up the target."""
+        regular_event = make_event("audio-start")
+        bridge._downstream = None
+        mock_downstream = AsyncMock()
+
+        async def fake_ensure_target(info_event=None):
+            bridge._downstream = mock_downstream
+            return True
+
+        bridge._ensure_target = AsyncMock(side_effect=fake_ensure_target)
+
+        await bridge.on_server_event(regular_event)
+
+        mock_downstream.process_event.assert_awaited_once_with(regular_event)
 
     @pytest.mark.asyncio
     async def test_on_target_event_success(self, bridge):
@@ -419,8 +471,17 @@ class TestEventHandling:
         assert "No server connection available for event: transcript" in caplog.text
 
 
+def make_asr_info_event() -> Event:
+    """A real target Info event for an ASR service."""
+    from wyoming.info import AsrProgram, Attribution
+    return Info(asr=[AsrProgram(
+        name="whisper", description="Whisper", attribution=Attribution(name="x", url="y"),
+        installed=True, version="1", models=[],
+    )]).event()
+
+
 class TestDescribeFlow:
-    """Test the describe flow handling."""
+    """Describe handling: per-connection replies, target built once."""
 
     @pytest.fixture
     def mock_async_client(self):
@@ -436,110 +497,112 @@ class TestDescribeFlow:
         return _factory
 
     @pytest.mark.asyncio
-    async def test_handle_describe_flow_success(self, bridge, mock_async_client):
-        """Test successful describe flow."""
-        describe_event = make_event("describe")
-        info_event = make_event("info")
-        wrapped_info_event = make_event("info_wrapped")
-        
-        # Mock AsyncClient
-        mock_client = mock_async_client([info_event, None])
-        
-        # Mock target connection
-        mock_target_class = MagicMock()
-        mock_target_instance = MagicMock()
-        mock_target_class.return_value = mock_target_instance
-        
-        bridge._server.write_event = AsyncMock()
-        bridge._build_event_flows = MagicMock()
-        
-        with patch('wyoming.client.AsyncClient.from_uri', return_value=mock_client), \
-             patch.object(Info, 'is_type', return_value=True), \
-             patch('wyoming_bridge.core.bridge.wrap_wyoming_info', return_value=wrapped_info_event), \
-             patch('wyoming_bridge.core.bridge.read_service_type', return_value="asr"), \
-             patch('wyoming_bridge.connections.target.WyomingTargetConnection.from_service_type', return_value=mock_target_class):
-            
-            await bridge._handle_describe_flow(describe_event)
-        
-        # Verify the flow
-        mock_client.connect.assert_called_once()
-        mock_client.write_event.assert_called_once_with(describe_event)
-        mock_target_class.assert_called_once_with(
-            uri=bridge._target_uri,
-            on_target_event=bridge.on_target_event
-        )
-        bridge._build_event_flows.assert_called_once()
-        bridge._server.write_event.assert_called_once_with(wrapped_info_event)
-        
-        assert bridge._target == mock_target_instance
+    async def test_fetch_target_info_success(self, bridge, mock_async_client):
+        mock_client = mock_async_client([make_asr_info_event()])
+
+        with patch('wyoming.client.AsyncClient.from_uri', return_value=mock_client):
+            info_event = await bridge._fetch_target_info()
+
+        assert info_event is not None and Info.is_type(info_event.type)
+        assert Info.from_event(info_event).asr[0].name == "bridge-to-whisper"
+        sent = mock_client.write_event.call_args.args[0]
+        assert Describe.is_type(sent.type)
 
     @pytest.mark.asyncio
-    async def test_handle_describe_flow_connection_error(self, bridge, caplog):
-        """Test describe flow with connection error."""
-        describe_event = make_event("describe")
-        
-        with patch('wyoming.client.AsyncClient.from_uri') as mock_from_uri:
-            mock_from_uri.side_effect = ConnectionError("Connection failed")
-            
-            await bridge._handle_describe_flow(describe_event)
-        
+    async def test_fetch_target_info_connection_error(self, bridge, caplog):
+        with patch('wyoming.client.AsyncClient.from_uri', side_effect=ConnectionError("Connection failed")):
+            assert await bridge._fetch_target_info() is None
         assert "Failed to connect to target: Connection failed" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_handle_describe_flow_timeout(self, bridge, caplog):
-        """Test describe flow with timeout."""
-        describe_event = make_event("describe")
-        
-        with patch('wyoming.client.AsyncClient.from_uri') as mock_from_uri:
-            mock_from_uri.side_effect = asyncio.TimeoutError()
-            
-            await bridge._handle_describe_flow(describe_event)
-        
-        assert "Timeout connecting to target" in caplog.text
+    async def test_fetch_target_info_timeout(self, bridge, caplog, mock_async_client):
+        async def never():
+            await asyncio.sleep(10)
 
-    @pytest.mark.asyncio
-    async def test_handle_describe_flow_unexpected_error(self, bridge, caplog):
-        """Test describe flow with unexpected error."""
-        describe_event = make_event("describe")
-        
-        with patch('wyoming.client.AsyncClient.from_uri') as mock_from_uri:
-            mock_from_uri.side_effect = Exception("Unexpected error")
-            
-            await bridge._handle_describe_flow(describe_event)
-        
-        assert "Unexpected error processing Describe" in caplog.text
+        mock_client = mock_async_client()
+        mock_client.read_event = AsyncMock(side_effect=never)
 
-    @pytest.mark.asyncio
-    async def test_handle_describe_flow_no_target_connection(self, bridge, caplog, mock_async_client):
-        """Test describe flow when no target connection is found."""
-        describe_event = make_event("describe")
-        info_event = make_event("info")
-        wrapped_info_event = make_event("info_wrapped")
-        
-        # Mock AsyncClient
-        mock_client = mock_async_client([info_event, None])
-        
         with patch('wyoming.client.AsyncClient.from_uri', return_value=mock_client), \
-             patch.object(Info, 'is_type', return_value=True), \
-             patch('wyoming_bridge.core.bridge.wrap_wyoming_info', return_value=wrapped_info_event), \
-             patch('wyoming_bridge.core.bridge.read_service_type', return_value="unknown"), \
-             patch('wyoming_bridge.connections.target.WyomingTargetConnection.from_service_type', return_value=None):
-            
-            await bridge._handle_describe_flow(describe_event)
-        
-        assert "No target connection found for service type 'unknown'" in caplog.text
+             patch('wyoming_bridge.core.bridge.DESCRIBE_TIMEOUT', 0.01):
+            assert await bridge._fetch_target_info() is None
+        assert "Timeout describing target" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_handle_describe_flow_connection_lost(self, bridge, mock_async_client):
-        """Test describe flow when connection is lost."""
-        describe_event = make_event("describe")
-        
-        # Mock AsyncClient that returns None immediately (connection lost)
+    async def test_fetch_target_info_unexpected_error(self, bridge, caplog):
+        with patch('wyoming.client.AsyncClient.from_uri', side_effect=Exception("boom")):
+            assert await bridge._fetch_target_info() is None
+        assert "Unexpected error describing target" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_fetch_target_info_connection_lost(self, bridge, mock_async_client):
         mock_client = mock_async_client([None])
-        
         with patch('wyoming.client.AsyncClient.from_uri', return_value=mock_client):
-            await bridge._handle_describe_flow(describe_event)
-        
-        # Should complete without error, just log connection lost
-        mock_client.connect.assert_called_once()
-        mock_client.write_event.assert_called_once_with(describe_event)
+            assert await bridge._fetch_target_info() is None
+
+    @pytest.mark.asyncio
+    async def test_ensure_target_builds_once(self, bridge):
+        """A second handshake must not replace the target or pipelines."""
+        info_event = wrap_info(make_asr_info_event())
+
+        assert await bridge._ensure_target(info_event)
+        target, downstream, upstream = bridge._target, bridge._downstream, bridge._upstream
+        assert target is not None and downstream is not None and upstream is not None
+
+        assert await bridge._ensure_target(info_event)
+        assert bridge._target is target
+        assert bridge._downstream is downstream
+        assert bridge._upstream is upstream
+
+    @pytest.mark.asyncio
+    async def test_ensure_target_unknown_service_type(self, bridge, caplog):
+        assert not await bridge._ensure_target(Info().event())
+        assert bridge._target is None
+        assert "No target connection found for service type 'None'" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_handle_describe_replies_on_requesting_writer_only(self, bridge):
+        """A mid-session Describe must not rebind the server or rebuild the target."""
+        info_event = wrap_info(make_asr_info_event())
+        bridge._fetch_target_info = AsyncMock(return_value=info_event)
+        assert await bridge._ensure_target(info_event)
+
+        live_writer = MagicMock()
+        await bridge.bind_server_handler("live-session", live_writer)
+        target, downstream = bridge._target, bridge._downstream
+
+        describe_writer = MagicMock()
+        with patch('wyoming_bridge.core.bridge.async_write_event', new=AsyncMock()) as write:
+            await bridge.handle_describe(describe_writer)
+
+        write.assert_awaited_once_with(info_event, describe_writer)
+        assert bridge.event_handler_id == "live-session"
+        assert bridge._server._writer is live_writer
+        assert bridge._target is target
+        assert bridge._downstream is downstream
+
+    @pytest.mark.asyncio
+    async def test_handle_describe_falls_back_to_cached_info(self, bridge, caplog):
+        cached = make_event("info")
+        bridge._info_event = cached
+        bridge._fetch_target_info = AsyncMock(return_value=None)
+
+        writer = MagicMock()
+        with patch('wyoming_bridge.core.bridge.async_write_event', new=AsyncMock()) as write:
+            await bridge.handle_describe(writer)
+
+        write.assert_awaited_once_with(cached, writer)
+        assert "answering Describe with cached Info" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_handle_describe_no_info_sends_nothing(self, bridge):
+        bridge._fetch_target_info = AsyncMock(return_value=None)
+
+        with patch('wyoming_bridge.core.bridge.async_write_event', new=AsyncMock()) as write:
+            await bridge.handle_describe(MagicMock())
+
+        write.assert_not_called()
+
+
+def wrap_info(event: Event) -> Event:
+    from wyoming_bridge.core.info import wrap_wyoming_info
+    return wrap_wyoming_info(event)

@@ -152,3 +152,43 @@ def test_init_subclass_requires_target_type():
     with pytest.raises(TypeError):
         class NoType(WyomingTargetConnection):
             pass
+
+
+@pytest.mark.asyncio
+async def test_stale_listener_does_not_touch_new_client():
+    """A target listener for a replaced client (e.g. still processing the previous
+    session's transcript when a new session connects) must not read from or
+    disconnect the new client."""
+    dummy = DummyTarget("dummy://uri", AsyncMock())
+    old_client = MagicMock()
+    old_client.read_event = AsyncMock(return_value=None)
+    new_client = MagicMock()
+    new_client.read_event = AsyncMock()
+    new_client.disconnect = AsyncMock()
+
+    dummy._client = new_client
+    dummy._is_connected = True
+
+    await dummy._listen_to_events(old_client)
+
+    assert dummy._client is new_client
+    assert dummy.is_connected()
+    new_client.read_event.assert_not_called()
+    new_client.disconnect.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_read_error_disconnects(monkeypatch):
+    dummy = DummyTarget("dummy://uri", AsyncMock())
+    mock_client = MagicMock()
+    mock_client.connect = AsyncMock()
+    mock_client.disconnect = AsyncMock()
+    mock_client.read_event = AsyncMock(side_effect=RuntimeError("socket broke"))
+    monkeypatch.setattr("wyoming.client.AsyncClient.from_uri", lambda uri: mock_client)
+
+    await dummy._connect()
+    await asyncio.sleep(0.05)
+
+    assert not dummy.is_connected()
+    assert dummy._client is None
+    mock_client.disconnect.assert_awaited_once()

@@ -37,7 +37,11 @@ async def main() -> None:
 
     configure_loggers(args)
     _LOGGER.info("Starting Wyoming Bridge version %s", __version__)
-    _LOGGER.debug(args)
+    # Never log the Home Assistant access token.
+    _LOGGER.debug({
+        key: ("<redacted>" if key == "hass_access_token" and value else value)
+        for key, value in vars(args).items()
+    })
 
     processors = get_processors(args.processors_path)
     hass = Homeassistant(

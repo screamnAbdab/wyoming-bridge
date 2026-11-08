@@ -168,3 +168,71 @@ async def test_connect_disconnect_sequence():
         assert mock_client.disconnect.call_count == 2
 
     await cleanup_listener_task(processor_connection)
+
+
+@pytest.mark.asyncio
+async def test_eof_marks_disconnected_and_releases_waiters(processor_connection):
+    """If the processor closes the connection, blocked callers return at once
+    instead of waiting out their timeout, and the next write reconnects."""
+    read_gate = asyncio.Event()
+
+    async def read_event():
+        await read_gate.wait()
+        return None  # clean EOF
+
+    mock_client = MagicMock()
+    mock_client.connect = AsyncMock()
+    mock_client.disconnect = AsyncMock()
+    mock_client.write_event = AsyncMock()
+    mock_client.read_event = AsyncMock(side_effect=read_event)
+
+    with patch("wyoming.client.AsyncClient.from_uri", return_value=mock_client):
+        pending = asyncio.create_task(
+            processor_connection.write_event(Event(type="transcript", data={}), wait_for_response=True, timeout=30)
+        )
+        await asyncio.sleep(0.01)
+        read_gate.set()
+        response = await asyncio.wait_for(pending, timeout=1)
+
+    assert response is None
+    assert not processor_connection._is_connected
+    assert processor_connection._client is None
+    assert processor_connection._listen_task is None
+    mock_client.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_read_error_disconnects_without_self_cancel(processor_connection):
+    """A read error inside the listener must fully clean up (it calls
+    _disconnect() from within its own task)."""
+    mock_client = MagicMock()
+    mock_client.connect = AsyncMock()
+    mock_client.disconnect = AsyncMock()
+    mock_client.read_event = AsyncMock(side_effect=RuntimeError("socket broke"))
+
+    with patch("wyoming.client.AsyncClient.from_uri", return_value=mock_client):
+        await processor_connection._connect()
+        await asyncio.sleep(0.01)
+
+    assert not processor_connection._is_connected
+    assert processor_connection._client is None
+    mock_client.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stale_listener_does_not_touch_new_client(processor_connection):
+    """A listener for a replaced client exits without disconnecting the new one."""
+    old_client = MagicMock()
+    old_client.read_event = AsyncMock(return_value=None)
+    old_client.disconnect = AsyncMock()
+    new_client = MagicMock()
+    new_client.disconnect = AsyncMock()
+
+    processor_connection._client = new_client
+    processor_connection._is_connected = True
+
+    await processor_connection._listen_to_events(old_client)
+
+    assert processor_connection._client is new_client
+    assert processor_connection._is_connected
+    new_client.disconnect.assert_not_called()

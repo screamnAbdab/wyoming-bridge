@@ -38,7 +38,7 @@ class WyomingTargetConnection(ABC):
             self._is_connected = True
 
             # Start background task to listen to target events
-            self._listen_task = asyncio.create_task(self._listen_to_events())
+            self._listen_task = asyncio.create_task(self._listen_to_events(self._client))
 
             _LOGGER.info("Connected to target '%s'", self._type)
 
@@ -73,33 +73,41 @@ class WyomingTargetConnection(ABC):
             finally:
                 self._client = None
 
-    async def _listen_to_events(self) -> None:
-        """Background task to continuously listen to events from target."""
-        if not self._client:
-            return
-            
-        try:
-            while self._is_connected and self._client:
-                try:
-                    event = await self._client.read_event()
-                    if event is None:
-                        _LOGGER.debug("Target connection closed")
-                        break
-                    
-                    # Handle target event
-                    await self._on_target_event(event)
+    async def _listen_to_events(self, client: Optional[AsyncClient] = None) -> None:
+        """Background task to continuously listen to events from target.
 
-                    if callable(self.on_target_event):
-                        await self.on_target_event(event)
-                    
-                except Exception:
-                    _LOGGER.exception("Error reading from target '%s'", self._type)
-                    raise
-                    
+        Bound to the client it was started for: if the connection is replaced
+        while this task is still running (e.g. a new session connects while
+        the previous one's response is still being processed upstream), the
+        task stops instead of reading from, or tearing down, the new client.
+        """
+        client = client or self._client
+        if not client:
+            return
+
+        try:
+            while self._is_connected and self._client is client:
+                event = await client.read_event()
+                if event is None:
+                    _LOGGER.debug("Target connection closed")
+                    break
+
+                # Handle target event
+                await self._on_target_event(event)
+
+                if callable(self.on_target_event):
+                    await self.on_target_event(event)
+
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            _LOGGER.exception("Target reader task failed")
+            _LOGGER.exception("Target reader task failed for '%s'", self._type)
+
+        # Clean EOF or read error: mark this connection dead so the next
+        # write reconnects, unless it has already been replaced.
+        if self._client is client:
             await self._disconnect()
-    
+
     async def write_event(self, event: Event) -> None:
         if not self._is_connected or not self._client:
             _LOGGER.debug("Target not connected")
