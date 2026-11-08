@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 import asyncio
 import logging
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Optional
 
 from wyoming.audio import AudioChunk
 from wyoming.client import AsyncClient
@@ -28,6 +28,7 @@ class WyomingTargetConnection(ABC):
         self._client = None
         self._is_connected = False
         self._write_lock = asyncio.Lock()
+        self._listen_task: Optional[asyncio.Task] = None
 
     async def _connect(self):
         try:
@@ -35,9 +36,9 @@ class WyomingTargetConnection(ABC):
             self._client = AsyncClient.from_uri(self._uri)
             await self._client.connect()
             self._is_connected = True
-            
+
             # Start background task to listen to target events
-            asyncio.create_task(self._listen_to_events())
+            self._listen_task = asyncio.create_task(self._listen_to_events())
 
             _LOGGER.info("Connected to target '%s'", self._type)
 
@@ -45,9 +46,23 @@ class WyomingTargetConnection(ABC):
             _LOGGER.exception("Failed to connect to target '%s'", self._type)
             await self._disconnect()
             raise
-        
+
     async def _disconnect(self) -> None:
         self._is_connected = False
+
+        # _listen_to_events() itself calls _disconnect() on error; guard against
+        # a task cancelling and then awaiting itself, which would deadlock.
+        if (
+            self._listen_task
+            and not self._listen_task.done()
+            and self._listen_task is not asyncio.current_task()
+        ):
+            self._listen_task.cancel()
+            try:
+                await self._listen_task
+            except asyncio.CancelledError:
+                pass
+        self._listen_task = None
 
         if self._client:
             try:
@@ -69,7 +84,7 @@ class WyomingTargetConnection(ABC):
                     event = await self._client.read_event()
                     if event is None:
                         _LOGGER.debug("Target connection closed")
-                        raise
+                        break
                     
                     # Handle target event
                     await self._on_target_event(event)
